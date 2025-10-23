@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Évaluation panoptique THINGS-only pour SemanticKITTI.
-# - Utilise PanopticEval de l'API officielle
-# - Décode correctement le panoptic 32 bits: sem = &0xFFFF, inst = >>16
-# - Zero-out des instances pour les classes "stuff"
-# - Résume uniquement PQ/RQ/SQ THINGS + détail par classe
-# - Garde-fou: alerte si Pred == GT
+# Évaluation panoptique THINGS-only pour SemanticKITTI (propre et robuste).
+# - Décode sem/inst depuis le panoptic uint32
+# - Remap RAW->TRAIN via learning_map
+# - Inst = 0 pour les classes non-THINGS (d'après YAML: "instances")
+# - Sanity-check: détecte si Pred == GT sur un échantillon
+# - Moyennes THINGS via IDs train (pas de KeyError sur des noms)
 
 import argparse
 import os
@@ -22,48 +22,56 @@ if REPO_ROOT not in sys.path:
 from auxiliary.eval_np import PanopticEval  # noqa: E402
 
 SPLITS = ["train", "valid", "test"]
-THING_NAMES = [
-    "car", "bicycle", "motorcycle", "truck", "other-vehicle",
-    "person", "bicyclist", "motorcyclist",
-]
 
-def load_yaml(path):
+def _load_yaml(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-def build_class_lut(learning_map):
-    maxkey = max(int(k) for k in learning_map.keys())
-    lut = np.zeros((maxkey + 100), dtype=np.int32)  # marge
-    keys = np.array([int(k) for k in learning_map.keys()], dtype=np.int32)
-    vals = np.array([int(v) for v in learning_map.values()], dtype=np.int32)
-    lut[keys] = vals
+def _build_lut_raw2train(learning_map: dict) -> np.ndarray:
+    # Keys in YAML are str; cast to int
+    items = {int(k): int(v) for k, v in learning_map.items()}
+    max_raw = max(items.keys()) if items else 0
+    lut = np.zeros(max_raw + 1 + 1024, dtype=np.int32)  # marge large
+    for raw, tid in items.items():
+        lut[raw] = tid
     return lut
 
-def list_label_files(root, seqs):
+def _list_label_files(root, seqs):
     out = []
     for s in seqs:
         s = f"{int(s):02d}"
         d = os.path.join(root, "sequences", s, "labels")
-        out.extend(sorted(os.path.join(d, fn) for fn in os.listdir(d) if fn.endswith(".label")))
+        if not os.path.isdir(d):
+            continue
+        out.extend(sorted(
+            os.path.join(d, fn) for fn in os.listdir(d) if fn.endswith(".label")
+        ))
     return out
 
-def list_pred_files(root, seqs):
+def _list_pred_files(root, seqs):
     out = []
     for s in seqs:
         s = f"{int(s):02d}"
         d = os.path.join(root, "sequences", s, "predictions")
-        out.extend(sorted(os.path.join(d, fn) for fn in os.listdir(d) if fn.endswith(".label")))
+        if not os.path.isdir(d):
+            continue
+        out.extend(sorted(
+            os.path.join(d, fn) for fn in os.listdir(d) if fn.endswith(".label")
+        ))
     return out
 
 def main():
-    parser = argparse.ArgumentParser("./evaluate_panoptic_things.py")
-    parser.add_argument("--dataset", "-d", required=True, type=str)
-    parser.add_argument("--predictions", "-p", required=False, type=str, default=None)
-    parser.add_argument("--split", "-s", choices=SPLITS, default="valid")
-    parser.add_argument("--data_cfg", "-dc", type=str, default="config/semantic-kitti.yaml")
-    parser.add_argument("--limit", "-l", type=int, default=None)
-    parser.add_argument("--min_inst_points", type=int, default=50)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser("./evaluate_panoptic_things.py")
+    ap.add_argument("-d", "--dataset", required=True, type=str,
+                    help="Racine du dataset SemanticKITTI.")
+    ap.add_argument("-p", "--predictions", default=None, type=str,
+                    help="Racine des prédictions (même orga que dataset). Défaut: = --dataset.")
+    ap.add_argument("-s", "--split", default="valid", choices=SPLITS)
+    ap.add_argument("-dc", "--data_cfg", default="config/semantic-kitti.yaml", type=str)
+    ap.add_argument("-l", "--limit", default=None, type=int)
+    ap.add_argument("--min_inst_points", default=50, type=int)
+    args = ap.parse_args()
+
     if args.predictions is None:
         args.predictions = args.dataset
 
@@ -77,28 +85,30 @@ def main():
     print("Min inst  :", args.min_inst_points)
     print("*" * 70)
 
-    # Charger config
-    cfg = load_yaml(args.data_cfg)
-    learning_map = {int(k): int(v) for k, v in cfg["learning_map"].items()}
-    learning_ignore = {int(k): int(v) for k, v in cfg["learning_ignore"].items()}
-    labels = {int(k): str(v) for k, v in cfg["labels"].items()}
-    inv_map = {int(k): int(v) for k, v in cfg["learning_map_inv"].items()}
+    cfg = _load_yaml(args.data_cfg)
+    labels = {int(k): str(v) for k, v in cfg["labels"].items()}                # train_id -> name
+    learning_map = {int(k): int(v) for k, v in cfg["learning_map"].items()}    # raw -> train
+    learning_ignore = {int(k): int(v) for k, v in cfg["learning_ignore"].items()}  # train -> 0/1
+    learning_map_inv = {int(k): int(v) for k, v in cfg["learning_map_inv"].items()} # train -> raw
+    raw_instances = set(int(x) for x in cfg.get("instances", []))              # RAW ids with instances
 
-    # IDs train ignorés
-    ignore_train_ids = [cid for cid, ign in learning_ignore.items() if int(ign) == 1]
-    stuff_train_ids = set(ignore_train_ids)  # par convention SemanticKITTI
+    # Déduire les IDs train des THINGS à partir des RAW "instances"
+    thing_train_ids = sorted({learning_map.get(rid, 0) for rid in raw_instances})
+    # Nettoyage: enlever 0 et ceux ignorés
+    thing_train_ids = [tid for tid in thing_train_ids if tid > 0 and learning_ignore.get(tid, 0) == 0]
+    if not thing_train_ids:
+        raise RuntimeError("Impossible de déduire des classes THINGS depuis le YAML (champ 'instances').")
 
     # LUT RAW->TRAIN
-    lut = build_class_lut(learning_map)
+    lut = _build_lut_raw2train(cfg["learning_map"])
 
-    # Séquences
+    # Séquences du split
     seqs = cfg["split"][args.split]
-    if not isinstance(seqs, list):
-        seqs = list(seqs)
+    seqs = list(seqs) if isinstance(seqs, (list, tuple)) else [seqs]
 
     # Fichiers
-    gt_files = list_label_files(args.dataset, seqs)
-    pr_files = list_pred_files(args.predictions, seqs)
+    gt_files = _list_label_files(args.dataset, seqs)
+    pr_files = _list_pred_files(args.predictions, seqs)
     if len(gt_files) == 0:
         raise RuntimeError("Aucun fichier GT trouvé.")
     if len(pr_files) == 0:
@@ -106,100 +116,90 @@ def main():
     if len(gt_files) != len(pr_files):
         raise RuntimeError(f"Compte différent GT={len(gt_files)} vs Pred={len(pr_files)}.")
 
-    # Garde-fou: si le chemin predictions == dataset et qu'il y a 'labels' au lieu de 'predictions'
-    if os.path.samefile(args.dataset, args.predictions):
-        print("[ALERTE] --predictions pointe sur --dataset. Vérifie que tes prédictions sont bien dans .../predictions/")
-    # Check rapide: ratio de fichiers identiques (GT vs Pred)
-    same_count = 0
-    for i in np.linspace(0, len(gt_files)-1, num=min(5, len(gt_files)), dtype=int):
-        g = np.fromfile(gt_files[i], dtype=np.uint32)
-        p = np.fromfile(pr_files[i], dtype=np.uint32)
-        if g.shape == p.shape and np.all(g == p):
-            same_count += 1
-    if same_count >= 3:
-        print("[ALERTE] Plusieurs fichiers Pred == GT. Tu évalues probablement la GT contre la GT.")
+    # Garde-fou: vérifie rapidement si Pred == GT pour quelques scans
+    try:
+        same_count = 0
+        sample_ids = np.linspace(0, len(gt_files)-1, num=min(5, len(gt_files)), dtype=int)
+        for i in sample_ids:
+            g = np.fromfile(gt_files[i], dtype=np.uint32)
+            p = np.fromfile(pr_files[i], dtype=np.uint32)
+            if g.shape == p.shape and np.array_equal(g, p):
+                same_count += 1
+        if same_count >= max(2, len(sample_ids)//2):
+            print("[ALERTE] Plusieurs fichiers Pred sont identiques aux GT. "
+                  "Vérifie que tu n'évalues pas GT vs GT.")
+    except Exception:
+        pass
 
-    # Panoptic evaluator
-    nr_classes = 1 + max(inv_map.keys())
+    # Prépare l'évaluateur
+    nr_classes = max(learning_map_inv.keys()) + 1  # borne sûre
+    ignore_train_ids = [tid for tid, ign in learning_ignore.items() if int(ign) == 1]
     peval = PanopticEval(nr_classes, None, ignore_train_ids, min_points=args.min_inst_points)
 
-    # Boucle
+    # Éval boucle
     t0 = time.time()
     for gt_path, pr_path in tqdm(zip(gt_files, pr_files), total=len(gt_files), desc="Evaluating scans", ncols=0):
         gt_pan = np.fromfile(gt_path, dtype=np.uint32)
         pr_pan = np.fromfile(pr_path, dtype=np.uint32)
+
         if args.limit is not None:
             n = int(args.limit)
-            gt_pan = gt_pan[:n]; pr_pan = pr_pan[:n]
+            gt_pan = gt_pan[:n]
+            pr_pan = pr_pan[:n]
 
-        # Décode
+        # Décode RAW sem + inst
         gt_sem_raw = (gt_pan & 0xFFFF).astype(np.int32)
         pr_sem_raw = (pr_pan & 0xFFFF).astype(np.int32)
         gt_inst = (gt_pan >> 16).astype(np.int32)
         pr_inst = (pr_pan >> 16).astype(np.int32)
 
-        # Remap sémantique en TRAIN
+        # Remap RAW -> TRAIN
         gt_sem = lut[gt_sem_raw]
         pr_sem = lut[pr_sem_raw]
 
-        # Zero-out instance sur les STUFF (train ids ignorés)
-        gt_inst = gt_inst * (~np.isin(gt_sem, list(stuff_train_ids)))
-        pr_inst = pr_inst * (~np.isin(pr_sem, list(stuff_train_ids)))
+        # Inst=0 hors THINGS (côté GT et Pred)
+        gt_non_thing = ~np.isin(gt_sem, thing_train_ids)
+        pr_non_thing = ~np.isin(pr_sem, thing_train_ids)
+        gt_inst[gt_non_thing] = 0
+        pr_inst[pr_non_thing] = 0
 
         peval.addBatch(pr_sem, pr_inst, gt_sem, gt_inst)
 
     dt = time.time() - t0
 
-    # Métriques
+    # Récupère les métriques
     class_PQ, class_SQ, class_RQ, class_all_PQ, class_all_SQ, class_all_RQ = peval.getPQ()
     class_IoU, class_all_IoU = peval.getSemIoU()
+    class_all_PQ = np.asarray(class_all_PQ).reshape(-1)
+    class_all_SQ = np.asarray(class_all_SQ).reshape(-1)
+    class_all_RQ = np.asarray(class_all_RQ).reshape(-1)
+    class_all_IoU = np.asarray(class_all_IoU).reshape(-1)
 
-    class_all_PQ = class_all_PQ.flatten().tolist()
-    class_all_SQ = class_all_SQ.flatten().tolist()
-    class_all_RQ = class_all_RQ.flatten().tolist()
-    class_all_IoU = class_all_IoU.flatten().tolist()
+    # Filtre THINGS par IDs train
+    th_idx = [tid for tid in thing_train_ids if tid < len(class_all_PQ)]
+    if not th_idx:
+        raise RuntimeError("Aucun ID train THINGS valide dans les métriques retournées.")
 
-    # Dico {nom: métriques}
-    output = {}
-    for train_id in range(len(class_all_PQ)):
-        name = labels.get(train_id, f"class_{train_id}")
-        output[name] = {
-            "PQ": class_all_PQ[train_id],
-            "RQ": class_all_RQ[train_id],
-            "SQ": class_all_SQ[train_id],
-            "IoU": class_all_IoU[train_id],
-        }
+    PQ_th = float(np.nanmean(class_all_PQ[th_idx]))
+    RQ_th = float(np.nanmean(class_all_RQ[th_idx]))
+    SQ_th = float(np.nanmean(class_all_SQ[th_idx]))
 
-    # THINGS only
-    present_things = [n for n in THING_NAMES if n in output]
-    if not present_things:
-        raise RuntimeError("Aucune classe THINGS présente selon le YAML. Vérifie 'labels' et 'learning_map'.")
-
-    def _mean(key):
-        vals = []
-        for n in present_things:
-            v = output[n].get(key, None)
-            if v is not None:
-                try: vals.append(float(v))
-                except: pass
-        return float(np.mean(vals)) if vals else float("nan")
-
-    PQ_th = _mean("PQ"); RQ_th = _mean("RQ"); SQ_th = _mean("SQ")
-
+    # Affichage global
     print("\n" + "=" * 60)
     print(" Résultats panoptiques — THINGS uniquement")
     print("=" * 60)
     print(f" Scans   : {len(gt_files)} | Temps: {dt:.2f} s")
-    print(f" Classes : {present_things}")
+    print(f" Things (train IDs) : {th_idx}")
     print(f" PQ_th   : {PQ_th:.4f}")
     print(f" RQ_th   : {RQ_th:.4f}")
     print(f" SQ_th   : {SQ_th:.4f}")
     print("=" * 60 + "\n")
 
+    # Détail par classe thing (nom + valeurs)
     print("Détail par classe (THINGS):")
-    for n in present_things:
-        e = output[n]
-        print(f" - {n:<15} PQ={e['PQ']:.4f} | RQ={e['RQ']:.4f} | SQ={e['SQ']:.4f}")
+    for tid in th_idx:
+        name = labels.get(int(tid), f"class_{int(tid)}")
+        print(f" - {name:<15} PQ={class_all_PQ[tid]:.4f} | RQ={class_all_RQ[tid]:.4f} | SQ={class_all_SQ[tid]:.4f}")
 
 if __name__ == "__main__":
     main()
